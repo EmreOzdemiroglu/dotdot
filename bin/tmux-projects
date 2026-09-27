@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Popup project/session picker for tmux. Requires tmux and fzf; no plugin manager.
+set -u
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+
+preview() {
+    local kind="${1:-}" target="${2:-}" path branch
+    if [[ "$kind" == S ]]; then
+        path=$(tmux display-message -p -t "$target" '#{session_path}' 2>/dev/null) || exit 0
+        printf '\033[1;36m  SESSION\033[0m  %s\n\n' "$(tmux display-message -p -t "$target" '#{session_name}')"
+        printf '  %s\n\n' "$path"
+        tmux list-windows -t "$target" -F '  #{?window_active,●,○} #{window_index}: #{window_name}  (#{window_panes} panes)' 2>/dev/null
+    else
+        path="$target"
+        [[ -d "$path" ]] || exit 0
+        printf '\033[1;36m  PROJECT\033[0m  %s\n\n  %s\n' "$(basename "$path")" "$path"
+    fi
+    if [[ -d "$path" ]] && git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        branch=$(git -C "$path" branch --show-current 2>/dev/null)
+        printf '\n  \033[1;35m⎇ %s\033[0m\n' "${branch:-detached HEAD}"
+        git -C "$path" status --short -uno 2>/dev/null | head -15
+    fi
+    if [[ "$kind" == P && -d "$path" ]]; then
+        printf '\n  \033[1;36mFiles\033[0m\n'
+        ls -A "$path" 2>/dev/null | head -15 | sed 's/^/  /'
+    fi
+}
+
+list_items() {
+    local id name path windows dir marker
+    # tmux session IDs are stable even if the session gets renamed.
+    while IFS=$'\t' read -r id name path windows; do
+        [[ -n "$id" ]] || continue
+        printf 'S\t● %s  [%s windows]\t%s\t%s\n' "$name" "$windows" "$id" "$path"
+    done < <(tmux list-sessions -F $'#{session_id}\t#{session_name}\t#{session_path}\t#{session_windows}' 2>/dev/null)
+
+    # List shallow repos first, then deeper worktrees (.git can be a file).
+    for depth in 2 3 4; do
+        while IFS= read -r -d '' marker; do
+            dir="${marker%/.git}"
+            printf 'P\t◇ %s\t%s\t~%s\n' "$(basename "$dir")" "$dir" "${dir#"$HOME"}"
+        done < <(find "$HOME/code" -mindepth "$depth" -maxdepth "$depth" -name .git -print0 2>/dev/null)
+    done
+
+    # Non-git top-level projects and notes are still selectable.
+    for dir in "$HOME/code"/* "$HOME/notes"; do
+        [[ -d "$dir" && ! -e "$dir/.git" && ! -L "$dir" ]] || continue
+        [[ -f "$dir/package.json" || -f "$dir/pyproject.toml" || -f "$dir/Cargo.toml" || "$dir" == "$HOME/notes" ]] || continue
+        printf 'P\t◇ %s\t%s\t~%s\n' "$(basename "$dir")" "$dir" "${dir#"$HOME"}"
+    done
+}
+
+switch_to() {
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$1"
+    else
+        tmux attach-session -t "$1"
+    fi
+}
+
+open_project() {
+    local path="$1" base name n id existing
+    [[ -d "$path" ]] || return 1
+    # Reuse a session for this exact directory instead of making duplicates.
+    while IFS=$'\t' read -r id existing; do
+        if [[ "$existing" == "$path" ]]; then switch_to "$id"; return; fi
+    done < <(tmux list-sessions -F $'#{session_id}\t#{session_path}')
+    base=$(basename "$path" | tr '. ' '__' | tr -cd '[:alnum:]_-')
+    [[ -n "$base" ]] || base=project
+    name="$base"; n=2
+    while tmux has-session -t "=$name" 2>/dev/null; do
+        name="${base}-${n}"; n=$((n + 1))
+    done
+    id=$(tmux new-session -d -P -F '#{session_id}' -s "$name" -c "$path") || return 1
+    switch_to "$id"
+}
+
+case "${1:-}" in
+    --preview) preview "${2:-}" "${3:-}"; exit ;;
+    --list) list_items; exit ;;
+esac
+
+if ! command -v fzf >/dev/null 2>&1; then
+    echo 'fzf kurulu değil.'; read -r _; exit 1
+fi
+
+# The popup starts in the invoking pane's directory (-d in the tmux binding).
+origin="$PWD"
+script="$HOME/.local/bin/tmux-projects"
+while :; do
+    output=$(mktemp) || exit 1
+    list_items | FZF_DEFAULT_OPTS='' fzf \
+        --ansi --no-sort --layout=reverse --delimiter=$'\t' --with-nth=2,4 \
+        --print-query --expect=ctrl-n,ctrl-o,ctrl-x,ctrl-r \
+        --border=rounded --border-label=' ◆ SESSIONS / PROJECTS ' \
+        --prompt='  / ' --pointer='▸' --marker='●' \
+        --header='enter: aç   ctrl-n: yeni oturum   ctrl-o: yeni pencere   ctrl-x: oturumu kapat   ctrl-r: yenile' \
+        --preview "$script --preview {1} {3}" --preview-window='right:50%:wrap' \
+        --color='bg:#1a1b26,bg+:#283457,fg:#a9b1d6,fg+:#c0caf5,hl:#7dcfff,hl+:#7dcfff,pointer:#7dcfff,header:#7a83a6,border:#414868,preview-border:#414868,query:#c0caf5,prompt:#7dcfff' \
+        > "$output"
+    result=$?
+    if (( result != 0 )); then rm -f "$output"; exit 0; fi
+    query=''; key=''; row=''
+    { IFS= read -r query || :; IFS= read -r key || :; IFS= read -r row || :; } < "$output"
+    rm -f "$output"
+    IFS=$'\t' read -r kind label target location <<< "$row"
+
+    case "$key" in
+        ctrl-r) continue ;;
+        ctrl-n)
+            path="$origin"
+            [[ "$kind" == P ]] && path="$target"
+            # A typed query with no highlighted result names the new session.
+            if [[ -z "$row" && -n "$query" ]]; then
+                name=$(printf '%s' "$query" | tr '. ' '__' | tr -cd '[:alnum:]_-')
+                if [[ -n "$name" ]] && ! tmux has-session -t "=$name" 2>/dev/null; then
+                    id=$(tmux new-session -d -P -F '#{session_id}' -s "$name" -c "$path") && switch_to "$id"
+                    exit $?
+                fi
+            fi
+            open_project "$path"; exit $? ;;
+        ctrl-o)
+            if [[ "$kind" == P && -d "$target" ]]; then
+                tmux new-window -c "$target" -n "$(basename "$target")"
+                exit $?
+            fi
+            continue ;;
+        ctrl-x)
+            [[ "$kind" == S ]] || continue
+            if [[ "$target" == "$(tmux display-message -p '#{session_id}')" ]]; then
+                printf 'Aktif oturum kapatılamaz. Devam etmek için Enter: '; read -r _
+                continue
+            fi
+            printf '%s oturumu silinsin mi? [y/N] ' "${label#● }"
+            read -r answer
+            [[ "$answer" == y || "$answer" == Y ]] && tmux kill-session -t "$target"
+            continue ;;
+        '')
+            if [[ "$kind" == S ]]; then switch_to "$target"; exit $?; fi
+            if [[ "$kind" == P ]]; then open_project "$target"; exit $?; fi ;;
+    esac
+done
